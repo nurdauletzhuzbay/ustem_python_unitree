@@ -112,9 +112,22 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ============================================================================
 # G1 AUDIO CLIENT — LED + built-in speaker via DDS
 # ============================================================================
+import random
+
+# Conversational gestures: (action_name, action_id) pairs
+_CONVO_GESTURES = [
+    ("high wave",      4),
+    ("face wave",      6),
+    ("clap",           5),
+    ("hands up",      10),
+    ("right hand up", 12),
+]
+
 class G1AudioClient:
     def __init__(self, network_interface: str):
         self.available = False
+        self.arm_client = None
+        self.arm_action_map = {}
         try:
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
             from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
@@ -130,12 +143,46 @@ class G1AudioClient:
         except Exception as e:
             print(f"SDK init error: {e}")
 
+        # Arm gestures (optional — skipped if unavailable)
+        if self.available:
+            try:
+                from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
+                self.arm_client = G1ArmActionClient()
+                self.arm_client.SetTimeout(10.0)
+                self.arm_client.Init()
+                # Build action map: name → id
+                ret, self.arm_action_map = self.arm_client.GetActionList()
+                if ret != 0:
+                    # Fallback: known IDs from the example
+                    self.arm_action_map = {
+                        "release arm": 0, "shake hand": 1, "high five": 2,
+                        "hug": 3, "high wave": 4, "clap": 5, "face wave": 6,
+                        "left kiss": 7, "heart": 8, "right heart": 9,
+                        "hands up": 10, "x-ray": 11, "right hand up": 12,
+                        "reject": 13, "right kiss": 14, "two-hand kiss": 15,
+                    }
+                print("G1 Arm action client initialized.")
+            except Exception as e:
+                print(f"Arm client unavailable: {e}")
+                self.arm_client = None
+
     def led(self, r: int, g: int, b: int):
         if self.available:
             try:
                 self.client.LedControl(r, g, b)
             except Exception as e:
                 print(f"LED error: {e}")
+
+    def arm_gesture(self, name: str):
+        """Execute a named arm action (non-blocking call, fire-and-forget)."""
+        if self.arm_client is None:
+            return
+        try:
+            action_id = self.arm_action_map.get(name)
+            if action_id is not None:
+                self.arm_client.ExecuteAction(action_id)
+        except Exception as e:
+            print(f"Arm gesture error: {e}")
 
     def stream_pcm_realtime(self, pcm_queue: queue.Queue,
                              app_name: str = "temirbek",
@@ -501,13 +548,35 @@ def speak_response(phrase_queue: queue.Queue, robot: G1AudioClient):
     fetcher = threading.Thread(target=tts_fetcher, daemon=True)
     fetcher.start()
 
+    def gesture_loop():
+        """Randomly perform conversational gestures while speaking."""
+        if robot.arm_client is None:
+            return
+        # Wait a moment before first gesture so speech is underway
+        time.sleep(1.5)
+        while g_is_speaking and g_running:
+            name, _ = random.choice(_CONVO_GESTURES)
+            robot.arm_gesture(name)
+            # Wait 3–6 s between gestures (each gesture takes ~2s itself)
+            interval = random.uniform(3.0, 6.0)
+            deadline = time.time() + interval
+            while g_is_speaking and g_running and time.time() < deadline:
+                time.sleep(0.1)
+        # Return arms to resting position
+        robot.arm_gesture("release arm")
+
     _write_state("speaking")
     robot.led(0, 100, 255)
     g_is_speaking = True
+
+    gesture_thread = threading.Thread(target=gesture_loop, daemon=True)
+    gesture_thread.start()
+
     robot.stream_pcm_realtime(pcm_queue, stream_id=stream_id)
     g_is_speaking = False
     robot.led(0, 0, 0)
 
+    gesture_thread.join(timeout=5)
     fetcher.join()
 
 
