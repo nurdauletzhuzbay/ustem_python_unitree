@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Temirbek Voice Assistant
-Built-in microphone + Built-in speaker (via DDS AudioClient) + Azure Neural TTS + AlemAI STT/LLM
+USB mic (VAD) + G1 built-in speaker (DDS PlayStream) + Azure Neural TTS + AlemAI STT/LLM
 
-Pipeline: record → STT → LLM (streaming) → TTS per sentence → play
+Pipeline: VAD record → STT → LLM (streaming) → Azure TTS per sentence → PlayStream
 TTS synthesis of sentence N overlaps with LLM generation of sentence N+1.
 """
 
@@ -13,30 +13,23 @@ import signal
 import subprocess
 import threading
 import time
-import select
 import struct
 import wave
-import tempfile
+import io
 import queue
 import json
 import html
+import math
+import collections
 from pathlib import Path
 from typing import List, Optional
 from dataclasses import dataclass
 import requests
 
 # Ensure repo root is on the path so unitree_sdk2py is importable
-# regardless of how/where the script is invoked
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
-# wav.py lives in the same directory — needed for play_pcm_stream
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
-
-from wav import play_pcm_stream
 
 # Load .env from the repo root
 def _load_env():
@@ -58,23 +51,30 @@ _load_env()
 # ============================================================================
 ALSA_INPUT_DEVICE = "plughw:CARD=Device,DEV=0"    # JMTek USB microphone
 
-AZURE_TTS_VOICE  = "kk-KZ-DauletNeural"           # Male Kazakh neural voice
+AZURE_TTS_VOICE  = "kk-KZ-DauletNeural"            # Male Kazakh neural voice
 AZURE_TTS_REGION = "eastus"
 
-SAMPLE_RATE      = 16000
+SAMPLE_RATE       = 16000
 MAX_HISTORY_TURNS = 8
-CHANNELS         = 1
+CHUNK_SIZE        = 1024
 
-# Flush LLM buffer to TTS when we hit a sentence delimiter and have enough text
+# VAD settings (calibrated for USB mic with motor noise)
+SILENCE_THRESHOLD      = 3200
+SILENCE_DURATION       = 1.5   # seconds of silence before stopping
+MIN_SPEECH_DURATION    = 0.8   # seconds
+SPEECH_START_THRESHOLD = 3500  # above noise peak to avoid false triggers
+
+# LLM sentence flushing
 SENTENCE_DELIMITERS = frozenset('.!?…:;')
-MIN_CHUNK_LEN = 25  # chars
+MIN_CHUNK_LEN = 25  # chars before flushing to TTS
 
 # ============================================================================
 # GLOBAL STATE
 # ============================================================================
-g_running       = True
-g_is_recording  = False
-g_stop_recording = False
+g_running    = True
+g_is_speaking = False
+
+http_session = requests.Session()
 
 @dataclass
 class ConversationTurn:
@@ -82,14 +82,22 @@ class ConversationTurn:
     assistant_message: str
 
 conversation_history: List[ConversationTurn] = []
+recent_transcriptions: collections.deque = collections.deque(maxlen=5)
+
+HALLUCINATION_PHRASES = [
+    "қасындастық елігі қазақстан",
+    "қазақстан",
+    "елігі",
+    "субтитры",
+    "переклад",
+]
 
 # ============================================================================
 # SIGNAL HANDLER
 # ============================================================================
 def signal_handler(sig, frame):
-    global g_running, g_is_recording
+    global g_running
     g_running = False
-    g_is_recording = False
     print("\nShutting down...")
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -100,6 +108,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ============================================================================
 class G1AudioClient:
     def __init__(self, network_interface: str):
+        self.available = False
         try:
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
             from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
@@ -107,11 +116,13 @@ class G1AudioClient:
             self.client = AudioClient()
             self.client.SetTimeout(10.0)
             self.client.Init()
+            self.client.SetVolume(100)
             self.available = True
-            print("G1 AudioClient initialized.")
+            print(f"G1 SDK initialized on {network_interface}")
+        except ImportError:
+            print("Unitree SDK not available. Speaker + LED disabled.")
         except Exception as e:
-            print(f"Warning: G1 AudioClient unavailable ({e}). LED/speaker disabled.")
-            self.available = False
+            print(f"SDK init error: {e}")
 
     def led(self, r: int, g: int, b: int):
         if self.available:
@@ -121,52 +132,182 @@ class G1AudioClient:
                 print(f"LED error: {e}")
 
     def play_pcm(self, pcm_bytes: bytes, app_name: str = "temirbek"):
-        """Stream raw PCM (16kHz mono 16-bit) to the built-in speaker via DDS."""
+        """Stream raw 16kHz mono 16-bit PCM to the built-in speaker via PlayStream."""
         if not self.available or not pcm_bytes or not g_running:
+            return False
+
+        chunk_size = 96000  # ~3 seconds at 16kHz 16-bit mono
+        sleep_time = chunk_size / 32000  # 16000 Hz × 2 bytes
+        stream_id  = str(int(time.time() * 1000))
+        offset     = 0
+        chunk_idx  = 0
+
+        print(f"  PlayStream: {len(pcm_bytes)} bytes, ~{len(pcm_bytes)/32000:.1f}s")
+        try:
+            while offset < len(pcm_bytes) and g_running:
+                chunk = pcm_bytes[offset:offset + chunk_size]
+                ret, _ = self.client.PlayStream(app_name, stream_id, chunk)
+                if ret != 0:
+                    print(f"  PlayStream chunk {chunk_idx} failed: code {ret}")
+                    return False
+                print(f"  Chunk {chunk_idx} sent ({len(chunk)} bytes)")
+                offset    += chunk_size
+                chunk_idx += 1
+                time.sleep(sleep_time)
+
+            # Wait for the last partial chunk to finish
+            remaining = len(pcm_bytes) % chunk_size
+            if remaining > 0:
+                time.sleep(remaining / 32000)
+
+            self.client.PlayStop(app_name)
+            return True
+        except Exception as e:
+            print(f"  PlayStream error: {e}")
+            return False
+
+    def test_speaker(self):
+        """Play a short beep to verify the speaker is working."""
+        if not self.available:
             return
-        play_pcm_stream(self.client, list(pcm_bytes), app_name)
+        print("Testing speaker...")
+        samples = [int(8000 * math.sin(2 * math.pi * 440 * i / SAMPLE_RATE))
+                   for i in range(int(SAMPLE_RATE * 0.3))]
+        self.play_pcm(struct.pack(f'{len(samples)}h', *samples))
+
+# ============================================================================
+# AUDIO UTILITIES
+# ============================================================================
+def calculate_rms(audio_chunk: bytes) -> float:
+    try:
+        count = len(audio_chunk) // 2
+        shorts = struct.unpack(f'{count}h', audio_chunk)
+        return (sum(s * s for s in shorts) / count) ** 0.5
+    except:
+        return 0.0
+
+def build_wav_bytes(audio_bytes: bytes) -> bytes:
+    """Build a WAV file in memory from raw PCM bytes."""
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio_bytes)
+    return buf.getvalue()
+
+# ============================================================================
+# RECORDING WITH VAD (USB mic via arecord)
+# ============================================================================
+def record_with_vad() -> Optional[bytes]:
+    """Record from USB mic, auto-stop on silence. Returns raw PCM bytes."""
+    if g_is_speaking:
+        return None
+
+    cmd = ['arecord', '-D', ALSA_INPUT_DEVICE,
+           '-f', 'S16_LE', '-r', str(SAMPLE_RATE), '-c', '1', '-q']
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, bufsize=CHUNK_SIZE * 2)
+
+        speech_chunks   = []
+        silence_frames  = 0
+        speech_started  = False
+        bytes_per_check = int(SAMPLE_RATE * 0.1) * 2  # 100ms
+        buf             = b''
+        rms_history     = []
+        total_bytes     = 0
+
+        print("Listening...")
+
+        while g_running and not g_is_speaking:
+            chunk = proc.stdout.read(CHUNK_SIZE * 2)
+            if not chunk:
+                break
+            buf += chunk
+
+            if len(buf) >= bytes_per_check:
+                check = buf[:bytes_per_check]
+                buf   = buf[bytes_per_check:]
+                rms   = calculate_rms(check)
+
+                if not speech_started and rms > SPEECH_START_THRESHOLD:
+                    speech_started = True
+                    silence_frames = 0
+                    print("Speech detected...")
+
+                if speech_started:
+                    speech_chunks.append(check)
+                    total_bytes += len(check)
+                    rms_history.append(rms)
+
+                    if rms < SILENCE_THRESHOLD:
+                        silence_frames += 1
+                    else:
+                        silence_frames = 0
+
+                    if silence_frames * 0.1 >= SILENCE_DURATION:
+                        print("Silence, processing...")
+                        break
+
+        proc.terminate()
+        proc.wait(timeout=2)
+
+        if speech_chunks and rms_history:
+            duration = (total_bytes // 2) / SAMPLE_RATE
+            if duration < MIN_SPEECH_DURATION:
+                print(f"Too short ({duration:.1f}s), skipping.")
+                return None
+            print(f"Recorded {duration:.1f}s, avg RMS: {sum(rms_history)/len(rms_history):.0f}")
+            return b''.join(speech_chunks)
+
+        return None
+    except Exception as e:
+        print(f"Recording error: {e}")
+        return None
 
 # ============================================================================
 # SPEECH-TO-TEXT — AlemAI Whisper
 # ============================================================================
-def transcribe_audio(audio_pcm: List[int]) -> str:
+def is_hallucination(text: str) -> bool:
+    if not text or len(text.strip()) < 3:
+        return True
+    t = text.lower().strip()
+    for phrase in HALLUCINATION_PHRASES:
+        if phrase.lower() in t:
+            return True
+    if sum(1 for x in recent_transcriptions if x == t) >= 2:
+        return True
+    recent_transcriptions.append(t)
+    return False
+
+def transcribe_audio(audio_bytes: bytes) -> str:
     if not g_running:
         return ""
-
     api_key = os.getenv("ALEMAI_STT_API_KEY")
     if not api_key:
         print("ERROR: ALEMAI_STT_API_KEY not set")
         return ""
-
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-        wav_path = tmp.name
-
     try:
-        with wave.open(wav_path, 'wb') as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(struct.pack(f'{len(audio_pcm)}h', *audio_pcm))
-
-        with open(wav_path, 'rb') as f:
-            resp = requests.post(
-                "https://llm.alem.ai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                files={'file': ('audio.wav', f, 'audio/wav')},
-                data={'model': 'speech-to-text-kk'},
-                timeout=15
-            )
-
+        wav_data = build_wav_bytes(audio_bytes)
+        resp = http_session.post(
+            "https://llm.alem.ai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')},
+            data={'model': 'speech-to-text-kk'},
+            timeout=15
+        )
         if resp.status_code == 200:
-            return resp.json().get('text', '').strip()
+            text = resp.json().get('text', '').strip()
+            if is_hallucination(text):
+                print(f"Hallucination filtered: '{text}'")
+                return ""
+            return text
         print(f"STT error: {resp.status_code}")
         return ""
     except Exception as e:
-        print(f"Transcription error: {e}")
+        print(f"STT error: {e}")
         return ""
-    finally:
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
 
 # ============================================================================
 # LLM STREAMING — AlemAI (OpenAI-compatible SSE)
@@ -180,12 +321,7 @@ SYSTEM_PROMPT = (
 )
 
 def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
-    """
-    Streams the LLM response token by token.
-    Pushes complete sentences into sentence_queue as they form.
-    Puts None as a sentinel when done.
-    Returns the full response text.
-    """
+    """Stream LLM response, pushing complete sentences into sentence_queue."""
     if not g_running:
         sentence_queue.put(None)
         return ""
@@ -204,10 +340,10 @@ def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
     messages.append({"role": "user", "content": user_text})
 
     full_reply = ""
-    buffer = ""
+    buffer     = ""
 
     try:
-        with requests.post(
+        with http_session.post(
             "https://llm.alem.ai/v1/chat/completions",
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {api_key}"},
@@ -243,7 +379,7 @@ def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
                 full_reply += token
                 print(token, end='', flush=True)
 
-                # Flush buffer at sentence boundary once we have enough text
+                # Flush buffer at sentence boundary
                 flush_at = -1
                 for i, ch in enumerate(buffer):
                     if ch in SENTENCE_DELIMITERS and i >= MIN_CHUNK_LEN - 1:
@@ -258,7 +394,6 @@ def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
     except Exception as e:
         print(f"\nLLM error: {e}")
 
-    # Flush any trailing text
     if buffer.strip() and g_running:
         sentence_queue.put(buffer.strip())
 
@@ -269,22 +404,20 @@ def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
 # TEXT-TO-SPEECH — Azure Neural TTS (REST API)
 # ============================================================================
 def azure_tts(text: str) -> Optional[bytes]:
-    """Returns raw WAV bytes (riff-16khz-16bit-mono-pcm) or None on error."""
+    """Returns WAV bytes (riff-16khz-16bit-mono-pcm) or None on error."""
     if not g_running or not text.strip():
         return None
-
     api_key = os.getenv("AZURE_TTS_API_KEY")
     if not api_key:
         print("ERROR: AZURE_TTS_API_KEY not set")
         return None
-
     ssml = (
         f'<speak version="1.0" xml:lang="kk-KZ">'
         f'<voice name="{AZURE_TTS_VOICE}">{html.escape(text)}</voice>'
         f'</speak>'
     )
     try:
-        resp = requests.post(
+        resp = http_session.post(
             f"https://{AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
             headers={
                 "Ocp-Apim-Subscription-Key": api_key,
@@ -296,29 +429,18 @@ def azure_tts(text: str) -> Optional[bytes]:
             timeout=10
         )
         if resp.status_code == 200:
-            return resp.content  # includes WAV header
+            return resp.content  # includes 44-byte WAV header
         print(f"TTS error: {resp.status_code} {resp.text[:120]}")
         return None
     except Exception as e:
         print(f"TTS error: {e}")
         return None
 
-def play_wav(wav_bytes: bytes, robot: 'G1AudioClient'):
-    """Strip WAV header and stream raw PCM to the built-in speaker via DDS."""
-    if not wav_bytes or not g_running:
-        return
-    # Azure TTS returns a standard 44-byte RIFF/WAV header before PCM data
-    robot.play_pcm(wav_bytes[44:])
-
 # ============================================================================
-# TTS WORKER — synthesizes and plays sentences as they arrive from the queue
+# TTS WORKER — synthesizes and plays sentences as they arrive
 # ============================================================================
 def tts_worker(sentence_queue: queue.Queue, robot: G1AudioClient):
-    """
-    Runs in its own thread.
-    For each sentence from the queue: synthesize with Azure TTS, then play.
-    Exits when it receives the None sentinel.
-    """
+    global g_is_speaking
     while g_running:
         try:
             sentence = sentence_queue.get(timeout=0.3)
@@ -331,61 +453,21 @@ def tts_worker(sentence_queue: queue.Queue, robot: G1AudioClient):
         wav = azure_tts(sentence)
         if wav and g_running:
             robot.led(0, 100, 255)  # blue = speaking
-            play_wav(wav, robot)
+            g_is_speaking = True
+            robot.play_pcm(wav[44:])  # strip 44-byte WAV header → raw PCM
+            g_is_speaking = False
 
     robot.led(0, 0, 0)
-
-# ============================================================================
-# AUDIO RECORDING
-# ============================================================================
-def record_audio() -> List[int]:
-    global g_is_recording, g_stop_recording
-
-    pcm = []
-    try:
-        proc = subprocess.Popen(
-            ['arecord', '-D', ALSA_INPUT_DEVICE, '-f', 'S16_LE',
-             '-r', str(SAMPLE_RATE), '-c', '1', '-q'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
-        print("Recording... (Press ENTER to stop)")
-
-        while g_running and g_is_recording and not g_stop_recording:
-            chunk = proc.stdout.read(2048)
-            if not chunk:
-                break
-            pcm.extend(struct.unpack(f'{len(chunk)//2}h', chunk))
-
-        proc.terminate()
-        proc.wait(timeout=1)
-        print(f"Stopped ({len(pcm) / SAMPLE_RATE:.1f}s)")
-    except Exception as e:
-        print(f"Recording error: {e}")
-
-    return pcm
-
-# ============================================================================
-# INPUT MONITOR THREAD
-# ============================================================================
-def input_monitor():
-    global g_stop_recording
-    while g_running:
-        if g_is_recording:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if ready:
-                sys.stdin.readline()
-                g_stop_recording = True
-        time.sleep(0.05)
+    g_is_speaking = False
 
 # ============================================================================
 # MAIN
 # ============================================================================
 def main():
-    global g_running, g_is_recording, g_stop_recording, conversation_history
+    global g_running
 
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <NetworkInterface>")
+        print(f"Usage: {sys.argv[0]} <NetworkInterface> [--test-speaker]")
         return 1
 
     for key in ("ALEMAI_STT_API_KEY", "ALEMAI_LLM_API_KEY", "AZURE_TTS_API_KEY"):
@@ -395,95 +477,87 @@ def main():
 
     robot = G1AudioClient(sys.argv[1])
 
-    print("\n" + "=" * 44)
+    if '--test-speaker' in sys.argv:
+        robot.test_speaker()
+        return 0
+
+    print("\n" + "=" * 46)
     print("  Temirbek — Conversation Buddy")
-    print("=" * 44)
+    print("=" * 46)
     print("  STT : AlemAI Whisper (Kazakh)")
     print("  LLM : AlemLLM (streaming SSE)")
     print("  TTS : Azure Neural — kk-KZ-DauletNeural")
     print(f"  Mic : {ALSA_INPUT_DEVICE} (USB)")
     print(f"  Spk : G1 built-in (DDS PlayStream)")
+    print(f"  VAD : silence={SILENCE_THRESHOLD} speech={SPEECH_START_THRESHOLD}")
     print(f"  Mem : last {MAX_HISTORY_TURNS} turns")
-    print("=" * 44)
-    print("  ENTER       → start / stop recording")
-    print("  'тазала'    → clear conversation memory")
-    print("  Ctrl+C      → quit")
-    print("=" * 44 + "\n")
+    print("=" * 46)
+    print("  Say 'тазала/clear' → reset memory")
+    print("  Say 'тоқта/stop'   → quit")
+    print("  Ctrl+C             → quit")
+    print("=" * 46 + "\n")
 
     robot.led(0, 255, 0)
     time.sleep(0.4)
     robot.led(0, 0, 0)
     print("Ready.\n")
 
-    threading.Thread(target=input_monitor, daemon=True).start()
+    try:
+        while g_running:
+            robot.led(0, 255, 0)  # green = listening
+            audio = record_with_vad()
+            robot.led(0, 0, 0)
 
-    while g_running:
-        print("Press ENTER to speak...")
-        ready, _, _ = select.select([sys.stdin], [], [], 0.5)
-        if not g_running:
-            break
-        if not ready:
-            continue
+            if not g_running or not audio:
+                continue
 
-        sys.stdin.readline()
-        if not g_running:
-            break
+            # STT
+            robot.led(255, 255, 0)  # yellow = transcribing
+            print("Transcribing...")
+            text = transcribe_audio(audio)
+            if not g_running or not text:
+                print("Transcription failed.\n")
+                continue
 
-        # --- Record ---
-        g_is_recording  = True
-        g_stop_recording = False
-        robot.led(255, 0, 0)  # red = recording
-        audio = record_audio()
-        g_is_recording = False
+            print(f"\nYou: {text}")
+
+            lower = text.lower()
+            if any(w in lower for w in ('тазала', 'жаңарт', 'clear', 'reset')):
+                conversation_history.clear()
+                print("Memory cleared.\n")
+                continue
+            if any(w in lower for w in ('тоқта', 'stop', 'exit', 'quit', 'шығу')):
+                print("Stopping.")
+                break
+
+            # LLM streaming + TTS pipeline
+            print("Temirbek: ", end='', flush=True)
+            robot.led(255, 165, 0)  # orange = thinking
+
+            sq = queue.Queue()
+            worker = threading.Thread(target=tts_worker, args=(sq, robot), daemon=True)
+            worker.start()
+
+            full_reply = stream_llm(text, sq)
+            worker.join()
+            print()
+
+            if full_reply:
+                conversation_history.append(
+                    ConversationTurn(user_message=text, assistant_message=full_reply)
+                )
+                if len(conversation_history) > MAX_HISTORY_TURNS:
+                    conversation_history.pop(0)
+                print(f"[memory: {len(conversation_history)}/{MAX_HISTORY_TURNS} turns]\n")
+
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    finally:
+        g_running = False
+        http_session.close()
         robot.led(0, 0, 0)
 
-        if not g_running or not audio:
-            break
-        if len(audio) < SAMPLE_RATE * 0.5:
-            print("Too short, skipping.\n")
-            continue
-
-        # --- STT ---
-        print("Transcribing...")
-        text = transcribe_audio(audio)
-        if not text:
-            print("Could not transcribe, try again.\n")
-            continue
-
-        print(f"\nYou: {text}")
-
-        if any(w in text.lower() for w in ('тазала', 'жаңарт', 'clear')):
-            conversation_history.clear()
-            print("Memory cleared.\n")
-            continue
-
-        # --- LLM streaming + TTS pipeline ---
-        print("Temirbek: ", end='', flush=True)
-        robot.led(255, 165, 0)  # orange = thinking
-
-        sq = queue.Queue()
-
-        # TTS worker: synthesizes and plays each sentence as it arrives
-        worker = threading.Thread(target=tts_worker, args=(sq, robot), daemon=True)
-        worker.start()
-
-        # LLM streams into sq; returns full reply when done
-        full_reply = stream_llm(text, sq)
-
-        # Wait until the last sentence finishes playing
-        worker.join()
-        print()
-
-        if full_reply:
-            conversation_history.append(
-                ConversationTurn(user_message=text, assistant_message=full_reply)
-            )
-            if len(conversation_history) > MAX_HISTORY_TURNS:
-                conversation_history.pop(0)
-            print(f"[memory: {len(conversation_history)}/{MAX_HISTORY_TURNS} turns]\n")
-
     print("Goodbye.")
-    robot.led(0, 0, 0)
     return 0
 
 if __name__ == "__main__":
