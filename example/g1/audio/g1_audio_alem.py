@@ -25,9 +25,15 @@ from typing import List, Optional
 from dataclasses import dataclass
 import requests
 
-# Load .env from the repo root (two levels up from this file)
+# Ensure repo root is on the path so unitree_sdk2py is importable
+# regardless of how/where the script is invoked
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Load .env from the repo root
 def _load_env():
-    env_path = Path(__file__).resolve().parents[3] / ".env"
+    env_path = _REPO_ROOT / ".env"
     if not env_path.exists():
         return
     with open(env_path) as f:
