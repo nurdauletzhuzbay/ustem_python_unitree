@@ -411,23 +411,48 @@ def get_llm_response(user_text: str, tts_queue: queue.Queue) -> str:
     return full_reply
 
 # ============================================================================
-# TTS WORKER — runs parallel to LLM, plays each phrase as it arrives
+# TTS WORKER — prefetch pipeline: fetch and play run in parallel
+#
+#   tts_queue (phrases) → [fetcher thread] → wav_queue (WAV bytes) → [player]
+#
+# While the player plays sentence N, the fetcher is already calling Azure TTS
+# for sentence N+1. When sentence N finishes, N+1 is ready immediately.
 # ============================================================================
 def tts_worker(tts_queue: queue.Queue, robot: 'G1AudioClient'):
     global g_is_speaking
+
+    wav_queue = queue.Queue(maxsize=2)  # pre-fetch up to 2 sentences ahead
+
+    def fetcher():
+        while g_running:
+            try:
+                phrase = tts_queue.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if phrase is None:
+                wav_queue.put(None)  # pass sentinel to player
+                break
+            wav = azure_tts(phrase)
+            wav_queue.put(wav)  # blocks if player is falling behind (backpressure)
+
+    fetch_thread = threading.Thread(target=fetcher, daemon=True)
+    fetch_thread.start()
+
+    # Player: drains wav_queue and plays each chunk immediately
     while g_running:
         try:
-            phrase = tts_queue.get(timeout=0.3)
+            wav = wav_queue.get(timeout=0.3)
         except queue.Empty:
             continue
-        if phrase is None:
+        if wav is None:
             break
-        wav = azure_tts(phrase)
-        if wav and g_running:
+        if wav:
             robot.led(0, 100, 255)  # blue = speaking
             g_is_speaking = True
             robot.play_pcm(wav[44:])
             g_is_speaking = False
+
+    fetch_thread.join()
     robot.led(0, 0, 0)
     g_is_speaking = False
 
