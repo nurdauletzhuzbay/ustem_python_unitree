@@ -1,0 +1,14 @@
+[Unit]
+Description=Temirbek web control panel
+After=network.target tailscaled.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/nurda/ustem_python_unitree/example/g1/audio/server.py
+WorkingDirectory=/home/nurda/ustem_python_unitree
+Restart=always
+RestartSec=5
+User=nurda
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

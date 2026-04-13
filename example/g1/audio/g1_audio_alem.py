@@ -71,6 +71,15 @@ SPEECH_START_THRESHOLD = 3500  # above noise peak to avoid false triggers
 g_running    = True
 g_is_speaking = False
 
+_STATE_FILE = "/tmp/temirbek_state"
+
+def _write_state(state: str):
+    try:
+        with open(_STATE_FILE, 'w') as f:
+            f.write(state)
+    except Exception:
+        pass
+
 http_session = requests.Session()
 
 @dataclass
@@ -492,6 +501,7 @@ def speak_response(phrase_queue: queue.Queue, robot: G1AudioClient):
     fetcher = threading.Thread(target=tts_fetcher, daemon=True)
     fetcher.start()
 
+    _write_state("speaking")
     robot.led(0, 100, 255)
     g_is_speaking = True
     robot.stream_pcm_realtime(pcm_queue, stream_id=stream_id)
@@ -582,6 +592,7 @@ def main():
 
     try:
         while g_running:
+            _write_state("listening")
             robot.led(0, 255, 0)  # green = listening
             audio = record_with_vad()
             robot.led(0, 0, 0)
@@ -590,6 +601,7 @@ def main():
                 continue
 
             # STT
+            _write_state("thinking")
             robot.led(255, 255, 0)  # yellow = transcribing
             print("Transcribing...")
             text = transcribe_audio(audio)
@@ -641,6 +653,7 @@ def main():
         g_running = False
         http_session.close()
         robot.led(0, 0, 0)
+        _write_state("idle")
 
     print("Goodbye.")
     return 0
