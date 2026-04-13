@@ -31,6 +31,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# wav.py lives in the same directory — needed for play_pcm_stream
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from wav import play_pcm_stream
+
 # Load .env from the repo root
 def _load_env():
     env_path = _REPO_ROOT / ".env"
@@ -117,21 +124,7 @@ class G1AudioClient:
         """Stream raw PCM (16kHz mono 16-bit) to the built-in speaker via DDS."""
         if not self.available or not pcm_bytes or not g_running:
             return
-        stream_id = str(int(time.time() * 1000))
-        chunk_size = 32000  # 1 second at 16kHz 16-bit mono
-        offset = 0
-        try:
-            while offset < len(pcm_bytes) and g_running:
-                chunk = pcm_bytes[offset:offset + chunk_size]
-                ret, _ = self.client.PlayStream(app_name, stream_id, chunk)
-                if ret != 0:
-                    print(f"PlayStream error: {ret}")
-                    break
-                offset += chunk_size
-                # Sleep slightly under chunk duration to keep buffer fed without gaps
-                time.sleep(len(chunk) / (16000 * 2) * 0.85)
-        except Exception as e:
-            print(f"Playback error: {e}")
+        play_pcm_stream(self.client, list(pcm_bytes), app_name)
 
 # ============================================================================
 # SPEECH-TO-TEXT — AlemAI Whisper
