@@ -723,13 +723,8 @@ def main():
 
             # LLM streams tokens to screen and pushes phrases into phrase_q
             full_reply = get_llm_response(text, phrase_q)
-            speaker.join()
-            print()
 
-            if not full_reply:
-                continue
-
-            # Context-aware gesture after speech
+            # Trigger gesture while speech is still playing
             gesture = pick_gesture(text, full_reply)
             if gesture:
                 _write_gesture(gesture)
@@ -737,6 +732,12 @@ def main():
                     target=lambda g=gesture: (robot.arm_gesture(g), _write_gesture("")),
                     daemon=True
                 ).start()
+
+            speaker.join()
+            print()
+
+            if not full_reply:
+                continue
 
             conversation_history.append(
                 ConversationTurn(user_message=text, assistant_message=full_reply)
