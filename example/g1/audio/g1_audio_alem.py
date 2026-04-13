@@ -56,7 +56,7 @@ _load_env()
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-ALSA_INPUT_DEVICE = "default"                      # Built-in microphone
+ALSA_INPUT_DEVICE = "plughw:CARD=Device,DEV=0"    # JMTek USB microphone
 
 AZURE_TTS_VOICE  = "kk-KZ-DauletNeural"           # Male Kazakh neural voice
 AZURE_TTS_REGION = "eastus"
@@ -401,7 +401,7 @@ def main():
     print("  STT : AlemAI Whisper (Kazakh)")
     print("  LLM : AlemLLM (streaming SSE)")
     print("  TTS : Azure Neural — kk-KZ-DauletNeural")
-    print(f"  Mic : {ALSA_INPUT_DEVICE} (built-in)")
+    print(f"  Mic : {ALSA_INPUT_DEVICE} (USB)")
     print(f"  Spk : G1 built-in (DDS PlayStream)")
     print(f"  Mem : last {MAX_HISTORY_TURNS} turns")
     print("=" * 44)
