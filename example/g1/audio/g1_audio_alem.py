@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Temirbek Voice Assistant
-External microphone (USB) + External speaker (USB) + Azure Neural TTS + AlemAI STT/LLM
+Built-in microphone + Built-in speaker (via DDS AudioClient) + Azure Neural TTS + AlemAI STT/LLM
 
 Pipeline: record → STT → LLM (streaming) → TTS per sentence → play
 TTS synthesis of sentence N overlaps with LLM generation of sentence N+1.
@@ -43,8 +43,7 @@ _load_env()
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-ALSA_OUTPUT_DEVICE = "plughw:CARD=Audio,DEV=0"   # Moshi USB speaker
-ALSA_INPUT_DEVICE  = "plughw:CARD=Device,DEV=0"  # JMTek USB microphone
+ALSA_INPUT_DEVICE = "default"                      # Built-in microphone
 
 AZURE_TTS_VOICE  = "kk-KZ-DauletNeural"           # Male Kazakh neural voice
 AZURE_TTS_REGION = "eastus"
@@ -84,20 +83,21 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # ============================================================================
-# G1 LED CONTROL
+# G1 AUDIO CLIENT — LED + built-in speaker via DDS
 # ============================================================================
 class G1AudioClient:
     def __init__(self, network_interface: str):
         try:
-            from unitree.robot.channel.channel_factory import ChannelFactory
-            from unitree.robot.g1.audio.g1_audio_client import AudioClient
-            ChannelFactory.Instance().Init(0, network_interface)
+            from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+            from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+            ChannelFactoryInitialize(0, network_interface)
             self.client = AudioClient()
-            self.client.Init()
             self.client.SetTimeout(10.0)
+            self.client.Init()
             self.available = True
-        except ImportError:
-            print("Warning: Unitree SDK not available. LED control disabled.")
+            print("G1 AudioClient initialized.")
+        except Exception as e:
+            print(f"Warning: G1 AudioClient unavailable ({e}). LED/speaker disabled.")
             self.available = False
 
     def led(self, r: int, g: int, b: int):
@@ -106,6 +106,26 @@ class G1AudioClient:
                 self.client.LedControl(r, g, b)
             except Exception as e:
                 print(f"LED error: {e}")
+
+    def play_pcm(self, pcm_bytes: bytes, app_name: str = "temirbek"):
+        """Stream raw PCM (16kHz mono 16-bit) to the built-in speaker via DDS."""
+        if not self.available or not pcm_bytes or not g_running:
+            return
+        stream_id = str(int(time.time() * 1000))
+        chunk_size = 32000  # 1 second at 16kHz 16-bit mono
+        offset = 0
+        try:
+            while offset < len(pcm_bytes) and g_running:
+                chunk = pcm_bytes[offset:offset + chunk_size]
+                ret, _ = self.client.PlayStream(app_name, stream_id, chunk)
+                if ret != 0:
+                    print(f"PlayStream error: {ret}")
+                    break
+                offset += chunk_size
+                # Sleep slightly under chunk duration to keep buffer fed without gaps
+                time.sleep(len(chunk) / (16000 * 2) * 0.85)
+        except Exception as e:
+            print(f"Playback error: {e}")
 
 # ============================================================================
 # SPEECH-TO-TEXT — AlemAI Whisper
@@ -284,24 +304,17 @@ def azure_tts(text: str) -> Optional[bytes]:
         print(f"TTS error: {e}")
         return None
 
-def play_wav(wav_bytes: bytes):
-    """Pipe WAV bytes (with header) to aplay on the USB speaker."""
+def play_wav(wav_bytes: bytes, robot: 'G1AudioClient'):
+    """Strip WAV header and stream raw PCM to the built-in speaker via DDS."""
     if not wav_bytes or not g_running:
         return
-    try:
-        proc = subprocess.Popen(
-            ['aplay', '-D', ALSA_OUTPUT_DEVICE, '-q'],
-            stdin=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
-        proc.communicate(input=wav_bytes)
-    except Exception as e:
-        print(f"Playback error: {e}")
+    # Azure TTS returns a standard 44-byte RIFF/WAV header before PCM data
+    robot.play_pcm(wav_bytes[44:])
 
 # ============================================================================
 # TTS WORKER — synthesizes and plays sentences as they arrive from the queue
 # ============================================================================
-def tts_worker(sentence_queue: queue.Queue, audio_client: G1AudioClient):
+def tts_worker(sentence_queue: queue.Queue, robot: G1AudioClient):
     """
     Runs in its own thread.
     For each sentence from the queue: synthesize with Azure TTS, then play.
@@ -318,10 +331,10 @@ def tts_worker(sentence_queue: queue.Queue, audio_client: G1AudioClient):
 
         wav = azure_tts(sentence)
         if wav and g_running:
-            audio_client.led(0, 100, 255)  # blue = speaking
-            play_wav(wav)
+            robot.led(0, 100, 255)  # blue = speaking
+            play_wav(wav, robot)
 
-    audio_client.led(0, 0, 0)
+    robot.led(0, 0, 0)
 
 # ============================================================================
 # AUDIO RECORDING
@@ -389,8 +402,8 @@ def main():
     print("  STT : AlemAI Whisper (Kazakh)")
     print("  LLM : AlemLLM (streaming SSE)")
     print("  TTS : Azure Neural — kk-KZ-DauletNeural")
-    print(f"  Mic : {ALSA_INPUT_DEVICE}")
-    print(f"  Spk : {ALSA_OUTPUT_DEVICE}")
+    print(f"  Mic : {ALSA_INPUT_DEVICE} (built-in)")
+    print(f"  Spk : G1 built-in (DDS PlayStream)")
     print(f"  Mem : last {MAX_HISTORY_TURNS} turns")
     print("=" * 44)
     print("  ENTER       → start / stop recording")
