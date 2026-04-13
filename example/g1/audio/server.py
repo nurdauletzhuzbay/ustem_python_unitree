@@ -34,7 +34,8 @@ _load_env()
 # ── config ────────────────────────────────────────────────────────────────────
 NETWORK_INTERFACE = os.getenv("ROBOT_NETWORK_INTERFACE", "eth0")
 SCRIPT = str(Path(__file__).parent / "g1_audio_alem.py")
-STATE_FILE = "/tmp/temirbek_state"
+STATE_FILE   = "/tmp/temirbek_state"
+GESTURE_FILE = "/tmp/temirbek_gesture"
 
 # ── process handle ────────────────────────────────────────────────────────────
 _proc: subprocess.Popen = None
@@ -86,9 +87,15 @@ def stop():
     _proc = None
     return jsonify(ok=True)
 
+def _read_gesture() -> str:
+    try:
+        return Path(GESTURE_FILE).read_text().strip()
+    except Exception:
+        return ""
+
 @app.route("/status")
 def status():
-    return jsonify(running=_is_running(), state=_read_state())
+    return jsonify(running=_is_running(), state=_read_state(), gesture=_read_gesture())
 
 # ── inline HTML (single-file, no templates) ───────────────────────────────────
 _HTML = """<!DOCTYPE html>
@@ -157,6 +164,13 @@ _HTML = """<!DOCTYPE html>
     box-shadow: none;
     cursor: default;
   }
+  #gesture-label {
+    font-size: 0.95rem;
+    color: #888;
+    min-height: 1.2em;
+    letter-spacing: 0.03em;
+    font-style: italic;
+  }
 </style>
 </head>
 <body>
@@ -165,6 +179,7 @@ _HTML = """<!DOCTYPE html>
   <div id="dot" class="idle"></div>
   <span id="status-label">Stopped</span>
 </div>
+<div id="gesture-label"></div>
 <button id="btn" class="start" onclick="toggle()">START</button>
 
 <script>
@@ -200,6 +215,8 @@ async function poll() {
     label.textContent = STATE_LABELS[state] || state;
     btn.textContent = running ? 'STOP' : 'START';
     btn.className   = running ? 'stop' : 'start';
+    const gesture = document.getElementById('gesture-label');
+    gesture.textContent = (d.gesture && state === 'speaking') ? d.gesture : '';
   } catch(e) {}
 }
 

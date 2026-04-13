@@ -71,12 +71,20 @@ SPEECH_START_THRESHOLD = 3500  # above noise peak to avoid false triggers
 g_running    = True
 g_is_speaking = False
 
-_STATE_FILE = "/tmp/temirbek_state"
+_STATE_FILE   = "/tmp/temirbek_state"
+_GESTURE_FILE = "/tmp/temirbek_gesture"
 
 def _write_state(state: str):
     try:
         with open(_STATE_FILE, 'w') as f:
             f.write(state)
+    except Exception:
+        pass
+
+def _write_gesture(name: str):
+    try:
+        with open(_GESTURE_FILE, 'w') as f:
+            f.write(name)
     except Exception:
         pass
 
@@ -153,13 +161,24 @@ class G1AudioClient:
                 # Build action map: name → id
                 ret, self.arm_action_map = self.arm_client.GetActionList()
                 if ret != 0:
-                    # Fallback: known IDs from the example
+                    # Fallback: correct IDs from the robot's action map
                     self.arm_action_map = {
-                        "release arm": 0, "shake hand": 1, "high five": 2,
-                        "hug": 3, "high wave": 4, "clap": 5, "face wave": 6,
-                        "left kiss": 7, "heart": 8, "right heart": 9,
-                        "hands up": 10, "x-ray": 11, "right hand up": 12,
-                        "reject": 13, "right kiss": 14, "two-hand kiss": 15,
+                        "release arm":   99,
+                        "two-hand kiss": 11,
+                        "left kiss":     12,
+                        "right kiss":    13,
+                        "hands up":      15,
+                        "clap":          17,
+                        "high five":     18,
+                        "hug":           19,
+                        "heart":         20,
+                        "right heart":   21,
+                        "reject":        22,
+                        "right hand up": 23,
+                        "x-ray":         24,
+                        "face wave":     25,
+                        "high wave":     26,
+                        "shake hand":    27,
                     }
                 print("G1 Arm action client initialized.")
             except Exception as e:
@@ -556,6 +575,7 @@ def speak_response(phrase_queue: queue.Queue, robot: G1AudioClient):
         time.sleep(1.5)
         while g_is_speaking and g_running:
             name, _ = random.choice(_CONVO_GESTURES)
+            _write_gesture(name)
             robot.arm_gesture(name)
             # Wait 3–6 s between gestures (each gesture takes ~2s itself)
             interval = random.uniform(3.0, 6.0)
@@ -563,6 +583,7 @@ def speak_response(phrase_queue: queue.Queue, robot: G1AudioClient):
             while g_is_speaking and g_running and time.time() < deadline:
                 time.sleep(0.1)
         # Return arms to resting position
+        _write_gesture("")
         robot.arm_gesture("release arm")
 
     _write_state("speaking")
