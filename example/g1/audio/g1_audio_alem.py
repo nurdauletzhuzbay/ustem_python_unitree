@@ -11,12 +11,10 @@ import os
 import sys
 import signal
 import subprocess
-import threading
 import time
 import struct
 import wave
 import io
-import queue
 import json
 import html
 import math
@@ -64,9 +62,6 @@ SILENCE_DURATION       = 1.5   # seconds of silence before stopping
 MIN_SPEECH_DURATION    = 0.8   # seconds
 SPEECH_START_THRESHOLD = 3500  # above noise peak to avoid false triggers
 
-# LLM sentence flushing
-SENTENCE_DELIMITERS = frozenset('.!?…:;')
-MIN_CHUNK_LEN = 25  # chars before flushing to TTS
 
 # ============================================================================
 # GLOBAL STATE
@@ -310,7 +305,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         return ""
 
 # ============================================================================
-# LLM STREAMING — AlemAI (OpenAI-compatible SSE)
+# LLM — AlemAI (streams tokens to screen, returns full reply for TTS)
 # ============================================================================
 SYSTEM_PROMPT = (
     "Сен Темірбек деген Unitree G1 роботысың. Қазақша сөйлейсің.\n"
@@ -320,16 +315,14 @@ SYSTEM_PROMPT = (
     "Жауаптарың қысқа (1–3 сөйлем), табиғи, дос сияқты. Ресми тіл қолданба."
 )
 
-def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
-    """Stream LLM response, pushing complete sentences into sentence_queue."""
+def get_llm_response(user_text: str) -> str:
+    """Stream LLM tokens to the screen, return the full reply for TTS."""
     if not g_running:
-        sentence_queue.put(None)
         return ""
 
     api_key = os.getenv("ALEMAI_LLM_API_KEY")
     if not api_key:
         print("ERROR: ALEMAI_LLM_API_KEY not set")
-        sentence_queue.put(None)
         return ""
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -340,8 +333,6 @@ def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
     messages.append({"role": "user", "content": user_text})
 
     full_reply = ""
-    buffer     = ""
-
     try:
         with http_session.post(
             "https://llm.alem.ai/v1/chat/completions",
@@ -353,9 +344,7 @@ def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
         ) as resp:
             if resp.status_code != 200:
                 print(f"LLM error: {resp.status_code}")
-                sentence_queue.put(None)
                 return ""
-
             for raw_line in resp.iter_lines():
                 if not g_running:
                     break
@@ -371,33 +360,12 @@ def stream_llm(user_text: str, sentence_queue: queue.Queue) -> str:
                     token = json.loads(data)['choices'][0]['delta'].get('content', '')
                 except (json.JSONDecodeError, KeyError):
                     continue
-
-                if not token:
-                    continue
-
-                buffer     += token
-                full_reply += token
-                print(token, end='', flush=True)
-
-                # Flush buffer at sentence boundary
-                flush_at = -1
-                for i, ch in enumerate(buffer):
-                    if ch in SENTENCE_DELIMITERS and i >= MIN_CHUNK_LEN - 1:
-                        flush_at = i
-
-                if flush_at >= 0:
-                    chunk = buffer[:flush_at + 1].strip()
-                    buffer = buffer[flush_at + 1:]
-                    if chunk:
-                        sentence_queue.put(chunk)
-
+                if token:
+                    full_reply += token
+                    print(token, end='', flush=True)
     except Exception as e:
         print(f"\nLLM error: {e}")
 
-    if buffer.strip() and g_running:
-        sentence_queue.put(buffer.strip())
-
-    sentence_queue.put(None)  # sentinel
     return full_reply
 
 # ============================================================================
@@ -436,29 +404,6 @@ def azure_tts(text: str) -> Optional[bytes]:
         print(f"TTS error: {e}")
         return None
 
-# ============================================================================
-# TTS WORKER — synthesizes and plays sentences as they arrive
-# ============================================================================
-def tts_worker(sentence_queue: queue.Queue, robot: G1AudioClient):
-    global g_is_speaking
-    while g_running:
-        try:
-            sentence = sentence_queue.get(timeout=0.3)
-        except queue.Empty:
-            continue
-
-        if sentence is None:
-            break
-
-        wav = azure_tts(sentence)
-        if wav and g_running:
-            robot.led(0, 100, 255)  # blue = speaking
-            g_is_speaking = True
-            robot.play_pcm(wav[44:])  # strip 44-byte WAV header → raw PCM
-            g_is_speaking = False
-
-    robot.led(0, 0, 0)
-    g_is_speaking = False
 
 # ============================================================================
 # MAIN
@@ -530,25 +475,30 @@ def main():
                 print("Stopping.")
                 break
 
-            # LLM streaming + TTS pipeline
+            # LLM → TTS → play
             print("Temirbek: ", end='', flush=True)
             robot.led(255, 165, 0)  # orange = thinking
 
-            sq = queue.Queue()
-            worker = threading.Thread(target=tts_worker, args=(sq, robot), daemon=True)
-            worker.start()
-
-            full_reply = stream_llm(text, sq)
-            worker.join()
+            full_reply = get_llm_response(text)
             print()
 
-            if full_reply:
-                conversation_history.append(
-                    ConversationTurn(user_message=text, assistant_message=full_reply)
-                )
-                if len(conversation_history) > MAX_HISTORY_TURNS:
-                    conversation_history.pop(0)
-                print(f"[memory: {len(conversation_history)}/{MAX_HISTORY_TURNS} turns]\n")
+            if not full_reply:
+                continue
+
+            conversation_history.append(
+                ConversationTurn(user_message=text, assistant_message=full_reply)
+            )
+            if len(conversation_history) > MAX_HISTORY_TURNS:
+                conversation_history.pop(0)
+            print(f"[memory: {len(conversation_history)}/{MAX_HISTORY_TURNS} turns]")
+
+            wav = azure_tts(full_reply)
+            if wav and g_running:
+                robot.led(0, 100, 255)  # blue = speaking
+                g_is_speaking = True
+                robot.play_pcm(wav[44:])
+                g_is_speaking = False
+            print()
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
