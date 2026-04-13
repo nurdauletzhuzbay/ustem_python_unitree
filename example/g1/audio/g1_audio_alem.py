@@ -122,13 +122,14 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ============================================================================
 import random
 
-# Conversational gestures: (action_name, action_id) pairs
+# Conversational gestures: (action_name, needs_release_after)
+# Gestures without release_after loop on their own; others need sleep+release
 _CONVO_GESTURES = [
-    ("high wave",      4),
-    ("face wave",      6),
-    ("clap",           5),
-    ("hands up",      10),
-    ("right hand up", 12),
+    ("high wave",      False),
+    ("face wave",      False),
+    ("clap",           False),
+    ("hands up",       True),
+    ("right hand up",  True),
 ]
 
 class G1AudioClient:
@@ -152,34 +153,14 @@ class G1AudioClient:
             print(f"SDK init error: {e}")
 
         # Arm gestures (optional — skipped if unavailable)
+        self._sdk_action_map = None
         if self.available:
             try:
-                from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
+                from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient, action_map as sdk_action_map
                 self.arm_client = G1ArmActionClient()
                 self.arm_client.SetTimeout(10.0)
                 self.arm_client.Init()
-                # Build action map: name → id
-                ret, self.arm_action_map = self.arm_client.GetActionList()
-                if ret != 0:
-                    # Fallback: correct IDs from the robot's action map
-                    self.arm_action_map = {
-                        "release arm":   99,
-                        "two-hand kiss": 11,
-                        "left kiss":     12,
-                        "right kiss":    13,
-                        "hands up":      15,
-                        "clap":          17,
-                        "high five":     18,
-                        "hug":           19,
-                        "heart":         20,
-                        "right heart":   21,
-                        "reject":        22,
-                        "right hand up": 23,
-                        "x-ray":         24,
-                        "face wave":     25,
-                        "high wave":     26,
-                        "shake hand":    27,
-                    }
+                self._sdk_action_map = sdk_action_map
                 print("G1 Arm action client initialized.")
             except Exception as e:
                 print(f"Arm client unavailable: {e}")
@@ -192,14 +173,20 @@ class G1AudioClient:
             except Exception as e:
                 print(f"LED error: {e}")
 
-    def arm_gesture(self, name: str):
-        """Execute a named arm action (non-blocking call, fire-and-forget)."""
-        if self.arm_client is None:
+    def arm_gesture(self, name: str, release_after: bool = False):
+        """Execute a named arm action using the SDK's action_map."""
+        if self.arm_client is None or self._sdk_action_map is None:
             return
         try:
-            action_id = self.arm_action_map.get(name)
-            if action_id is not None:
-                self.arm_client.ExecuteAction(action_id)
+            action_id = self._sdk_action_map.get(name)
+            if action_id is None:
+                print(f"Unknown gesture: {name}")
+                return
+            self.arm_client.ExecuteAction(action_id)
+            if release_after:
+                time.sleep(2)
+                self.arm_client.ExecuteAction(self._sdk_action_map.get("release arm"))
+            time.sleep(1)
         except Exception as e:
             print(f"Arm gesture error: {e}")
 
@@ -574,17 +561,18 @@ def speak_response(phrase_queue: queue.Queue, robot: G1AudioClient):
         # Wait a moment before first gesture so speech is underway
         time.sleep(1.5)
         while g_is_speaking and g_running:
-            name, _ = random.choice(_CONVO_GESTURES)
+            name, release_after = random.choice(_CONVO_GESTURES)
             _write_gesture(name)
-            robot.arm_gesture(name)
-            # Wait 3–6 s between gestures (each gesture takes ~2s itself)
-            interval = random.uniform(3.0, 6.0)
+            robot.arm_gesture(name, release_after=release_after)
+            # Wait 3–5 s between gestures
+            interval = random.uniform(3.0, 5.0)
             deadline = time.time() + interval
             while g_is_speaking and g_running and time.time() < deadline:
                 time.sleep(0.1)
         # Return arms to resting position
         _write_gesture("")
-        robot.arm_gesture("release arm")
+        if robot.arm_client and robot._sdk_action_map:
+            robot.arm_client.ExecuteAction(robot._sdk_action_map.get("release arm"))
 
     _write_state("speaking")
     robot.led(0, 100, 255)
