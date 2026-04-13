@@ -120,17 +120,8 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ============================================================================
 # G1 AUDIO CLIENT — LED + built-in speaker via DDS
 # ============================================================================
-import random
-
-# Conversational gestures: (action_name, needs_release_after)
-# Gestures without release_after loop on their own; others need sleep+release
-_CONVO_GESTURES = [
-    ("high wave",      False),
-    ("face wave",      False),
-    ("clap",           False),
-    ("hands up",       True),
-    ("right hand up",  True),
-]
+# Gestures that need sleep(2)+release arm after executing
+_GESTURE_RELEASE = {"reject", "hands up", "right hand up", "heart", "hug"}
 
 class G1AudioClient:
     def __init__(self, network_interface: str):
@@ -173,7 +164,7 @@ class G1AudioClient:
             except Exception as e:
                 print(f"LED error: {e}")
 
-    def arm_gesture(self, name: str, release_after: bool = False):
+    def arm_gesture(self, name: str):
         """Execute a named arm action using the SDK's action_map."""
         if self.arm_client is None or self._sdk_action_map is None:
             return
@@ -182,8 +173,9 @@ class G1AudioClient:
             if action_id is None:
                 print(f"Unknown gesture: {name}")
                 return
+            print(f"  [gesture] {name}")
             self.arm_client.ExecuteAction(action_id)
-            if release_after:
+            if name in _GESTURE_RELEASE:
                 time.sleep(2)
                 self.arm_client.ExecuteAction(self._sdk_action_map.get("release arm"))
             time.sleep(1)
@@ -524,6 +516,50 @@ def get_llm_response(user_text: str, phrase_queue: queue.Queue) -> str:
 
 
 # ============================================================================
+# CONTEXT-AWARE GESTURE SELECTION
+# ============================================================================
+def pick_gesture(user_text: str, assistant_text: str) -> Optional[str]:
+    """
+    Return a gesture name based on conversation context, or None.
+    Checked against both the user's message and the robot's reply.
+    """
+    u = user_text.lower()
+    a = assistant_text.lower()
+
+    # Greeting → face wave
+    if any(w in u for w in (
+        'сәлем', 'сәлеметсіз', 'салем', 'саламатсыз', 'hello', 'hi',
+        'привет', 'хай', 'ассалаумағалейкум', 'ассалам',
+    )):
+        return "face wave"
+
+    # Farewell → right kiss
+    if any(w in u for w in (
+        'сау бол', 'сау болыңыз', 'қош бол', 'қош болыңыз',
+        'bye', 'goodbye', 'good bye', 'пока', 'дейін', 'кездескенше',
+    )):
+        return "right kiss"
+
+    # Robot expresses disagreement / correction → reject
+    if any(w in a for w in (
+        'жоқ,', 'жоқ.', 'жоқ!', 'дұрыс емес', 'келіспеймін',
+        'мен де солай ойламаймын', 'қате', 'бұл дұрыс емес',
+        'мен қарсымын',
+    )):
+        return "reject"
+
+    # Funny / impressive / very positive → clap
+    if any(w in a for w in (
+        'керемет', 'тамаша', 'өте жақсы', 'өте керемет', 'таңқаларлық',
+        'ха-ха', 'хаха', 'смешно', 'қызықты екен', 'зор екен',
+        'wow', 'amazing', 'fantastic',
+    )):
+        return "clap"
+
+    return None
+
+
+# ============================================================================
 # TTS + PLAYBACK PIPELINE
 #
 #  phrase_queue → [tts_fetcher] → pcm_queue → [stream_pcm_realtime]
@@ -554,38 +590,13 @@ def speak_response(phrase_queue: queue.Queue, robot: G1AudioClient):
     fetcher = threading.Thread(target=tts_fetcher, daemon=True)
     fetcher.start()
 
-    def gesture_loop():
-        """Randomly perform conversational gestures while speaking."""
-        if robot.arm_client is None:
-            return
-        # Wait a moment before first gesture so speech is underway
-        time.sleep(1.5)
-        while g_is_speaking and g_running:
-            name, release_after = random.choice(_CONVO_GESTURES)
-            _write_gesture(name)
-            robot.arm_gesture(name, release_after=release_after)
-            # Wait 3–5 s between gestures
-            interval = random.uniform(3.0, 5.0)
-            deadline = time.time() + interval
-            while g_is_speaking and g_running and time.time() < deadline:
-                time.sleep(0.1)
-        # Return arms to resting position
-        _write_gesture("")
-        if robot.arm_client and robot._sdk_action_map:
-            robot.arm_client.ExecuteAction(robot._sdk_action_map.get("release arm"))
-
     _write_state("speaking")
     robot.led(0, 100, 255)
     g_is_speaking = True
-
-    gesture_thread = threading.Thread(target=gesture_loop, daemon=True)
-    gesture_thread.start()
-
     robot.stream_pcm_realtime(pcm_queue, stream_id=stream_id)
     g_is_speaking = False
     robot.led(0, 0, 0)
 
-    gesture_thread.join(timeout=5)
     fetcher.join()
 
 
@@ -717,6 +728,15 @@ def main():
 
             if not full_reply:
                 continue
+
+            # Context-aware gesture after speech
+            gesture = pick_gesture(text, full_reply)
+            if gesture:
+                _write_gesture(gesture)
+                threading.Thread(
+                    target=lambda g=gesture: (robot.arm_gesture(g), _write_gesture("")),
+                    daemon=True
+                ).start()
 
             conversation_history.append(
                 ConversationTurn(user_message=text, assistant_message=full_reply)
