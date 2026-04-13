@@ -11,10 +11,12 @@ import os
 import sys
 import signal
 import subprocess
+import threading
 import time
 import struct
 import wave
 import io
+import queue
 import json
 import html
 import math
@@ -305,7 +307,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         return ""
 
 # ============================================================================
-# LLM — AlemAI (streams tokens to screen, returns full reply for TTS)
+# LLM — AlemAI (streams tokens, flushes phrases to TTS queue immediately)
 # ============================================================================
 SYSTEM_PROMPT = (
     "Сен Темірбек деген Unitree G1 роботысың. Қазақша сөйлейсің.\n"
@@ -315,14 +317,26 @@ SYSTEM_PROMPT = (
     "Жауаптарың қысқа (1–3 сөйлем), табиғи, дос сияқты. Ресми тіл қолданба."
 )
 
-def get_llm_response(user_text: str) -> str:
-    """Stream LLM tokens to the screen, return the full reply for TTS."""
+# Split on sentence-ending punctuation or comma, but only after enough chars
+# so we don't send single words to Azure TTS.
+HARD_SPLIT = frozenset('.!?…')   # always split here
+SOFT_SPLIT = frozenset(',;:')    # split here only after MIN_CHARS
+MIN_CHARS  = 60                  # minimum chars before any split
+
+def get_llm_response(user_text: str, tts_queue: queue.Queue) -> str:
+    """
+    Stream LLM tokens to the screen.
+    Flush complete phrases into tts_queue as they form so TTS starts immediately.
+    Returns the full reply.
+    """
     if not g_running:
+        tts_queue.put(None)
         return ""
 
     api_key = os.getenv("ALEMAI_LLM_API_KEY")
     if not api_key:
         print("ERROR: ALEMAI_LLM_API_KEY not set")
+        tts_queue.put(None)
         return ""
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -333,6 +347,13 @@ def get_llm_response(user_text: str) -> str:
     messages.append({"role": "user", "content": user_text})
 
     full_reply = ""
+    buffer     = ""
+
+    def flush(buf: str):
+        buf = buf.strip()
+        if buf:
+            tts_queue.put(buf)
+
     try:
         with http_session.post(
             "https://llm.alem.ai/v1/chat/completions",
@@ -344,7 +365,9 @@ def get_llm_response(user_text: str) -> str:
         ) as resp:
             if resp.status_code != 200:
                 print(f"LLM error: {resp.status_code}")
+                tts_queue.put(None)
                 return ""
+
             for raw_line in resp.iter_lines():
                 if not g_running:
                     break
@@ -360,13 +383,53 @@ def get_llm_response(user_text: str) -> str:
                     token = json.loads(data)['choices'][0]['delta'].get('content', '')
                 except (json.JSONDecodeError, KeyError):
                     continue
-                if token:
-                    full_reply += token
-                    print(token, end='', flush=True)
+                if not token:
+                    continue
+
+                buffer     += token
+                full_reply += token
+                print(token, end='', flush=True)
+
+                # Flush as soon as we hit a split point with enough text
+                last_split = -1
+                for i, ch in enumerate(buffer):
+                    if ch in HARD_SPLIT:
+                        last_split = i
+                    elif ch in SOFT_SPLIT and len(buffer) >= MIN_CHARS:
+                        last_split = i
+
+                if last_split >= 0:
+                    flush(buffer[:last_split + 1])
+                    buffer = buffer[last_split + 1:]
+
     except Exception as e:
         print(f"\nLLM error: {e}")
 
+    # Flush any remaining text
+    flush(buffer)
+    tts_queue.put(None)  # sentinel
     return full_reply
+
+# ============================================================================
+# TTS WORKER — runs parallel to LLM, plays each phrase as it arrives
+# ============================================================================
+def tts_worker(tts_queue: queue.Queue, robot: 'G1AudioClient'):
+    global g_is_speaking
+    while g_running:
+        try:
+            phrase = tts_queue.get(timeout=0.3)
+        except queue.Empty:
+            continue
+        if phrase is None:
+            break
+        wav = azure_tts(phrase)
+        if wav and g_running:
+            robot.led(0, 100, 255)  # blue = speaking
+            g_is_speaking = True
+            robot.play_pcm(wav[44:])
+            g_is_speaking = False
+    robot.led(0, 0, 0)
+    g_is_speaking = False
 
 # ============================================================================
 # TEXT-TO-SPEECH — Azure Neural TTS (REST API)
@@ -475,11 +538,18 @@ def main():
                 print("Stopping.")
                 break
 
-            # LLM → TTS → play
+            # LLM streams → TTS worker plays phrases in parallel
             print("Temirbek: ", end='', flush=True)
             robot.led(255, 165, 0)  # orange = thinking
 
-            full_reply = get_llm_response(text)
+            tts_q = queue.Queue()
+            worker = threading.Thread(
+                target=tts_worker, args=(tts_q, robot), daemon=True
+            )
+            worker.start()
+
+            full_reply = get_llm_response(text, tts_q)
+            worker.join()  # wait for last phrase to finish playing
             print()
 
             if not full_reply:
@@ -490,15 +560,7 @@ def main():
             )
             if len(conversation_history) > MAX_HISTORY_TURNS:
                 conversation_history.pop(0)
-            print(f"[memory: {len(conversation_history)}/{MAX_HISTORY_TURNS} turns]")
-
-            wav = azure_tts(full_reply)
-            if wav and g_running:
-                robot.led(0, 100, 255)  # blue = speaking
-                g_is_speaking = True
-                robot.play_pcm(wav[44:])
-                g_is_speaking = False
-            print()
+            print(f"[memory: {len(conversation_history)}/{MAX_HISTORY_TURNS} turns]\n")
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
